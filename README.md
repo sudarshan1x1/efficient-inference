@@ -2,7 +2,7 @@
 
 An asynchronous load-testing and profiling framework for LLM serving, with 8 experiments run on a single 15 GB T4 GPU (Google Colab free tier). It measures how serving behaves as concurrent users grow from 1 to 100, and which optimizations actually help.
 
-**Full report:** [Serving LLMs Under Concurrent Load on a Single T4](https://claude.ai/artifact/MuUhCDrTHxquBuANAU7LXK)
+**Full report:** [Serving LLMs Under Concurrent Load on a Single T4](docs/efficient-inference-report.pdf)
 
 ![Throughput vs concurrent users](docs/figures/throughput_by_users.png)
 

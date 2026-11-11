@@ -1,0 +1,138 @@
+# Experiment plan for a Colab free-tier T4 (15 GB, compute capability 7.5).
+# One `defaults` block + per-config overrides, the same pattern as
+# systalyze's row.json (deployment as data) and the studio's combos.yaml.
+
+model: Qwen/Qwen2.5-1.5B-Instruct
+tokenizer: Qwen/Qwen2.5-1.5B-Instruct   # AWQ/GPTQ variants share this vocab
+port: 8000
+server_timeout_s: 900
+monitor_interval_s: 1.0
+
+defaults:
+  dtype: half                  # T4 has no bfloat16
+  max_model_len: 2048
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 256            # vLLM's default batch ceiling = continuous batching ON
+  prefix_caching: false        # off unless an experiment is about it
+
+workload:
+  isl: 512                     # EXACT input tokens for every request
+  osl: 128                     # EXACT output tokens (min_tokens == max_tokens)
+  requests_per_user: 4         # n_requests = max(min_requests, 4 * C); more samples -> steadier p95/p99
+  min_requests: 20
+  warmup_requests: 4
+  seed: 0
+
+experiments:
+
+  # 1) Main result: baseline vs optimizations across concurrency
+  concurrency_sweep:
+    workload: fixed
+    policy: closed
+    levels: [1, 10, 25, 50, 100]
+    configs:
+      - name: baseline_hf_naive         # plain transformers + HTTP, one request at a time:
+        engine: hf                      # how a first-version chatbot backend usually serves
+        requests_per_user: 1            # serial and slow (~15 min for all levels)
+        min_requests: 10
+      - name: vllm_no_batching          # vLLM engine, but one sequence at a time
+        max_num_seqs: 1
+        requests_per_user: 1            # serial serving is slow; keep the run short
+        min_requests: 10
+      - name: cb_fp16                   # continuous batching + paged KV cache
+      - name: cb_fp16_small_kv          # same, but starve the KV cache -> queueing / preemption
+        gpu_memory_utilization: 0.35
+      - name: cb_awq_int4               # 4-bit weights
+        model: Qwen/Qwen2.5-1.5B-Instruct-AWQ
+        quantization: awq
+      - name: cb_gptq_int8              # 8-bit weights (optional, ~5 extra minutes)
+        model: Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8
+        quantization: gptq
+        enabled: false
+      - name: cb_fp16_kv_fp8            # FP8 KV cache: 2x KV capacity. Experimental on T4.
+        kv_cache_dtype: fp8
+        enabled: false
+
+  # 2) KV-cache reuse: automatic prefix caching on a shared-system-prompt workload
+  prefix_caching:
+    workload: shared_prefix
+    prefix_len: 448                   # shared tokens; 64 unique tokens per request
+    policy: closed
+    levels: [1, 10, 50]
+    configs:
+      - name: prefix_cache_off
+        prefix_caching: false
+      - name: prefix_cache_on
+        prefix_caching: true
+
+  # 3) Why continuous batching matters: variable output lengths, static vs continuous
+  batching_policy:
+    workload: variable_osl            # output lengths drawn from the systalyze workload
+    osl_scale: 0.5                    # p50 ~100, p90 ~200 tokens
+    osl_cap: 256
+    levels: [10, 50]
+    configs:
+      - name: continuous_batching
+        policy: closed
+      - name: static_batching_waves
+        policy: waves
+
+  # 5) Generation stalls: how big a step may get when new prompts join the batch.
+  #    vLLM's chunked prefill packs up to max_num_batched_tokens into ONE step
+  #    (2048 by default on this setup). Smaller budget -> shorter decode stalls,
+  #    but prompts take more steps -> higher TTFT. Trade-off: TTFT vs ITL tail.
+  chunked_prefill:
+    workload: fixed
+    policy: closed
+    levels: [50, 100]
+    configs:
+      - name: mnbt_512
+        max_num_batched_tokens: 512
+      - name: mnbt_1024
+        max_num_batched_tokens: 1024
+      - name: mnbt_2048            # what vLLM picked by default in experiment 1
+        max_num_batched_tokens: 2048
+      - name: mnbt_4096
+        max_num_batched_tokens: 4096
+
+  # 6) Prefill cost vs prompt length (output fixed at 128). One server per engine.
+  #    If vLLM's TTFT gap vs HF grows with length -> attention kernel (TRITON_ATTN on sm75);
+  #    if the gap is constant -> fixed per-request overhead.
+  prompt_length:
+    workload: fixed
+    policy: closed
+    levels: [1, 25]
+    configs:
+      - {name: vllm_isl_128,  isl: 128}
+      - {name: vllm_isl_256,  isl: 256}
+      - {name: vllm_isl_512,  isl: 512}
+      - {name: vllm_isl_1024, isl: 1024}
+      - {name: hf_isl_128,  isl: 128,  engine: hf, levels: [1], min_requests: 10}
+      - {name: hf_isl_256,  isl: 256,  engine: hf, levels: [1], min_requests: 10}
+      - {name: hf_isl_512,  isl: 512,  engine: hf, levels: [1], min_requests: 10}
+      - {name: hf_isl_1024, isl: 1024, engine: hf, levels: [1], min_requests: 10}
+
+  # 7) Model size: decode is memory-bound, so single-user ITL should scale with
+  #    weight bytes - until fixed overheads set a floor (watch the 0.5B model).
+  model_size:
+    workload: fixed
+    policy: closed
+    levels: [1, 25, 100]
+    configs:
+      - name: qwen2.5_0.5b
+        model: Qwen/Qwen2.5-0.5B-Instruct
+      - name: qwen2.5_1.5b
+      - name: qwen2.5_3b
+        model: Qwen/Qwen2.5-3B-Instruct
+
+  # 8) Admission control: cap how many requests share the GPU at once.
+  #    Lower cap -> each admitted user decodes faster, but more users queue.
+  admission_control:
+    workload: fixed
+    policy: closed
+    levels: [100]
+    configs:
+      - {name: max_seqs_16,  max_num_seqs: 16}
+      - {name: max_seqs_32,  max_num_seqs: 32}
+      - {name: max_seqs_64,  max_num_seqs: 64}
+      - {name: max_seqs_256, max_num_seqs: 256}

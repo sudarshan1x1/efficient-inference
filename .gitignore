@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+
+# Editors and OS (you edit on Windows)
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Large or regenerable experiment outputs
+results/_cache/              # downloaded systalyze corpus (re-downloaded automatically)
+results/**/*_requests.jsonl  # raw per-request timings (large)
+results/**/*_monitor.csv     # 1 Hz monitor samples
+results/**/server.log        # vLLM logs (large, noisy)
+
+# Model caches, if any end up in the folder
+.cache/
+hf_cache/
+
+# Archives
+*.zip
